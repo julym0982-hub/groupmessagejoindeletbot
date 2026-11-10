@@ -176,7 +176,7 @@ service_filter = None
 if DELETE_JOIN_MESSAGES:
     service_filter = filters.StatusUpdate.NEW_CHAT_MEMBERS
 if DELETE_LEFT_MESSAGES:
-    left = filters.StatusUpdate.LEFT_CHAT_MEMBERS
+    left = filters.StatusUpdate.LEFT_CHAT_MEMBER
     service_filter = left if service_filter is None else service_filter | left
 
 
