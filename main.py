@@ -3,6 +3,9 @@ import asyncio
 import logging
 import os
 import sys
+import threading
+import time
+import urllib.request
 
 from pymongo import ASCENDING, MongoClient
 from telegram import Update
@@ -180,9 +183,31 @@ if DELETE_LEFT_MESSAGES:
     service_filter = left if service_filter is None else service_filter | left
 
 
+# ---------- Keepalive (stops Render free instance from sleeping) ----------
+KEEPALIVE_INTERVAL = 10 * 60  # seconds; Render sleeps after ~15 min without traffic
+
+
+def keepalive_loop() -> None:
+    """Ping our own public URL regularly so Render counts it as traffic."""
+    url = PUBLIC_URL.rstrip("/") + "/"
+    log.info("Keepalive started, pinging %s every %ds", url, KEEPALIVE_INTERVAL)
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                log.debug("Keepalive ping status %s", resp.status)
+        except Exception as exc:  # 404 from webhook root is still a successful wake-up
+            if hasattr(exc, "code"):
+                log.debug("Keepalive ping got HTTP %s (service is awake)", exc.code)
+            else:
+                log.warning("Keepalive ping failed: %s", exc)
+
+
 # ---------- Main ----------
 def main() -> None:
     log.info("Python version: %s", sys.version.split()[0])
+
+    threading.Thread(target=keepalive_loop, name="keepalive", daemon=True).start()
 
     # Newer Python versions (e.g. 3.14) need an explicit event loop for PTB 21.x
     loop = asyncio.new_event_loop()
