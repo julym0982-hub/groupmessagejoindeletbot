@@ -8,11 +8,12 @@ import time
 import urllib.request
 
 from pymongo import ASCENDING, MongoClient
-from telegram import Update
+from telegram import ChatMemberUpdated, Update
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -410,28 +411,17 @@ async def pm_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------- Inviter reward: bare admin ----------
-async def promote_inviter(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """If a user added someone else to the group, make the adder an admin with NO real rights.
+async def promote_inviter(chat, adder, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Make the user who added someone else an admin with NO real rights.
 
     The Bot API treats "all rights False" as a demotion, so we pass can_manage_chat=True:
     it is the baseline right every admin has (it is implied by any other right) and gives
     nothing that matters here: no delete / ban / invite / pin / change info / add admins.
     """
-    adder = message.from_user
-    chat = message.chat
-    if adder is None or adder.is_bot:
-        log.info("Promote skipped in chat %s: no human sender (%s)", chat.id, adder)
-        return
-    # Joining by yourself (e.g. via invite link) does not count; someone else must be added.
-    if not any(m.id != adder.id and not m.is_bot for m in message.new_chat_members):
-        log.info("Promote skipped in chat %s: %s joined by themselves / only bots added", chat.id, adder.id)
-        return
-
     try:
         member = await context.bot.get_chat_member(chat.id, adder.id)
         if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-            # Already an admin / the owner. Admins that someone else promoted can't be given a
-            # title by the bot, so this is only a real "nothing to do" for admins the bot made.
+            # Admins that someone else promoted can't be given a title by the bot.
             log.info("Promote skipped in chat %s: user %s is already %s", chat.id, adder.id, member.status)
             return
         await context.bot.promote_chat_member(
@@ -477,41 +467,63 @@ async def delete_message(message) -> None:
             return
 
 
-async def send_welcome(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    members = [m for m in message.new_chat_members if not m.is_bot]
-    if not members:
+async def send_welcome(chat_id: int, users, context: ContextTypes.DEFAULT_TYPE) -> None:
+    users = [u for u in users if not u.is_bot]
+    if not users:
         return
-    mentions = ", ".join(mention_html(m.id, m.full_name) for m in members)
+    mentions = ", ".join(mention_html(u.id, u.full_name) for u in users)
     text = render_welcome(await get_welcome(), mentions)
     try:
-        await context.bot.send_message(message.chat_id, text, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
     except TelegramError as exc:
-        log.warning("Welcome failed in chat %s: %s", message.chat_id, exc)
+        log.warning("Welcome failed in chat %s: %s", chat_id, exc)
+
+
+def _is_in_chat(member) -> bool:
+    if member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        return True
+    return member.status == ChatMemberStatus.RESTRICTED and bool(getattr(member, "is_member", False))
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Someone joined (or was added). Telegram sends these updates even in big groups,
+    where the "X joined" service message is not sent at all. Needs the bot to be an admin."""
+    cmu: ChatMemberUpdated = update.chat_member
+    if cmu is None:
+        return
+    chat = cmu.chat
+    user = cmu.new_chat_member.user
+    actor = cmu.from_user
+    joined = (not _is_in_chat(cmu.old_chat_member)) and _is_in_chat(cmu.new_chat_member)
+    if not joined or user.is_bot:
+        return
+
+    state = await get_chat(chat.id)
+    log.info(
+        "Join event in chat %s: enabled=%s delete=%s user=%s added_by=%s",
+        chat.id, state["enabled"], state["delete"], user.id, actor.id if actor else None,
+    )
+    if not state["enabled"]:
+        return
+
+    # Added by another person (joining by yourself / via link does not count)
+    if actor is not None and not actor.is_bot and actor.id != user.id:
+        await promote_inviter(chat, actor, context)
+
+    if not state["delete"]:  # /stopdelete mode: say welcome
+        await send_welcome(chat.id, [user], context)
 
 
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The "X joined" service message (small groups only): delete it in /startdelete mode."""
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
         return
 
     state = await get_chat(chat.id)
-    log.info(
-        "Join event in chat %s: enabled=%s delete=%s from=%s new=%s",
-        chat.id,
-        state["enabled"],
-        state["delete"],
-        message.from_user.id if message.from_user else None,
-        [m.id for m in message.new_chat_members],
-    )
-    if not state["enabled"]:
-        return
-
-    await promote_inviter(message, context)  # before the join message is deleted
-    if state["delete"]:
-        await delete_message(message)  # /startdelete: delete the notification, no welcome
-    else:
-        await send_welcome(message, context)  # /stopdelete: keep the notification, say welcome
+    if state["enabled"] and state["delete"]:
+        await delete_message(message)
 
 
 async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -590,7 +602,10 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", pm_cancel, filters=private))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, pm_text))
 
-    # Join / leave service messages
+    # Join events (promote + welcome); works in big groups too
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+
+    # Join / leave service messages (delete only)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS & groups, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER & groups, on_left_member))
 
