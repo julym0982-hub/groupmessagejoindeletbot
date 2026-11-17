@@ -31,6 +31,8 @@ MONGO_URI = os.environ["MONGODB_URI"]
 MONGO_DB = os.environ.get("MONGODB_DB", "joinbot")
 PUBLIC_URL = os.environ["RENDER_EXTERNAL_URL"]  # Render sets this automatically
 PORT = int(os.environ.get("PORT", "10000"))
+# Only this Telegram user id may use /start and /stop (get your id from @userinfobot)
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 # Which service messages to delete
 DELETE_JOIN_MESSAGES = True   # "X joined the group"
@@ -41,6 +43,9 @@ mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
 db = mongo[MONGO_DB]
 settings = db["chat_settings"]
 settings.create_index([("chat_id", ASCENDING)], unique=True)
+# Users this bot promoted to "title-only" admin (only they may use /edittag)
+promoted = db["promoted_users"]
+promoted.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
 # In-memory cache: chat_id -> enabled. Avoids a DB round-trip for every service message.
 _enabled_cache: dict[int, bool] = {}
@@ -57,6 +62,18 @@ def _db_set_enabled(chat_id: int, value: bool) -> None:
         {"$set": {"enabled": value}},
         upsert=True,
     )
+
+
+def _db_mark_promoted(chat_id: int, user_id: int) -> None:
+    promoted.update_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {"$set": {"chat_id": chat_id, "user_id": user_id}},
+        upsert=True,
+    )
+
+
+def _db_is_promoted(chat_id: int, user_id: int) -> bool:
+    return promoted.find_one({"chat_id": chat_id, "user_id": user_id}, {"_id": 1}) is not None
 
 
 async def is_enabled(chat_id: int) -> bool:
@@ -77,24 +94,10 @@ async def set_enabled(chat_id: int, value: bool) -> None:
 
 
 # ---------- Helpers ----------
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    chat = update.effective_chat
-    message = update.effective_message
-
-    # Anonymous admin: the message is sent "as the group" (sender_chat == chat)
-    if message and message.sender_chat and message.sender_chat.id == chat.id:
-        return True
-
+def is_bot_owner(update: Update) -> bool:
+    """Only the single user whose id is in the ADMIN_ID env var may control the bot."""
     user = update.effective_user
-    if user is None:
-        return False
-
-    try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-    except TelegramError:
-        log.exception("get_chat_member failed in chat %s", chat.id)
-        return False
-    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    return user is not None and user.id == ADMIN_ID
 
 
 async def safe_reply(update: Update, text: str) -> None:
@@ -106,8 +109,8 @@ async def safe_reply(update: Update, text: str) -> None:
 
 # ---------- Commands ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_admin(update, context):
-        await safe_reply(update, "ဒီ command ကို admin တွေသာ သုံးနိုင်ပါတယ်။")
+    if not is_bot_owner(update):
+        await safe_reply(update, "ဒီ command ကို bot ပိုင်ရှင် admin တစ်ယောက်တည်းသာ သုံးနိုင်ပါတယ်။")
         return
 
     try:
@@ -125,8 +128,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_admin(update, context):
-        await safe_reply(update, "ဒီ command ကို admin တွေသာ သုံးနိုင်ပါတယ်။")
+    if not is_bot_owner(update):
+        await safe_reply(update, "ဒီ command ကို bot ပိုင်ရှင် admin တစ်ယောက်တည်းသာ သုံးနိုင်ပါတယ်။")
         return
 
     try:
@@ -137,6 +140,80 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await safe_reply(update, "bot ရပ်နားလိုက်ပါပြီ ⏸")
+
+
+async def cmd_edittag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/edittag <text> : change your own tag (admin custom title). Only for users the bot promoted."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if user is None:
+        return
+
+    try:
+        allowed = await asyncio.to_thread(_db_is_promoted, chat.id, user.id)
+    except Exception:
+        log.exception("DB read failed for chat %s", chat.id)
+        await safe_reply(update, "ခဏ ပြဿနာရှိနေပါတယ်။ ခဏနေ ပြန်ကြိုးစားပါ။")
+        return
+    if not allowed:
+        await safe_reply(update, "group ထဲကို member တစ်ယောက် ထည့်ပေးထားမှ /edittag ကို သုံးလို့ရပါမယ်။")
+        return
+
+    tag = " ".join(context.args).strip() if context.args else ""
+    if not tag:
+        await safe_reply(update, "အသုံးပြုပုံ - /edittag အရာရာစိတ်ကြိုက်")
+        return
+    if len(tag) > 16:
+        await safe_reply(update, "Tag က စာလုံး ၁၆ လုံးထက် မကျော်ရပါဘူး။")
+        return
+
+    try:
+        await context.bot.set_chat_administrator_custom_title(chat.id, user.id, tag)
+    except BadRequest as exc:
+        log.warning("Custom title failed in chat %s: %s", chat.id, exc)
+        await safe_reply(update, "Tag ပြောင်းလို့မရပါ (emoji မသုံးရပါ၊ ၁၆ လုံးအတွင်းဖြစ်ရပါမယ်)။")
+        return
+    except TelegramError as exc:
+        log.warning("Custom title failed in chat %s: %s", chat.id, exc)
+        await safe_reply(update, "Tag ပြောင်းလို့မရပါ။ ခဏနေ ပြန်ကြိုးစားပါ။")
+        return
+
+    await safe_reply(update, f"Tag ကို \"{tag}\" သို့ ပြောင်းပေးလိုက်ပါပြီ ✅")
+
+
+# ---------- Inviter reward: bare admin ----------
+async def promote_inviter(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """If a user added someone else to the group, make the adder an admin with NO real rights.
+
+    The Bot API treats "all rights False" as a demotion, so we pass can_manage_chat=True:
+    it is the baseline right every admin has (it is implied by any other right) and gives
+    nothing that matters here: no delete / ban / invite / pin / change info / add admins.
+    """
+    adder = message.from_user
+    chat = message.chat
+    if adder is None or adder.is_bot:
+        return
+    # Joining by yourself (e.g. via invite link) does not count; someone else must be added.
+    if not any(m.id != adder.id and not m.is_bot for m in message.new_chat_members):
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, adder.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return  # already an admin / the owner: nothing to do
+        await context.bot.promote_chat_member(
+            chat.id,
+            adder.id,
+            is_anonymous=False,
+            can_manage_chat=True,
+        )
+        await asyncio.to_thread(_db_mark_promoted, chat.id, adder.id)
+        log.info("Promoted user %s to title-only admin in chat %s", adder.id, chat.id)
+    except TelegramError:
+        # Most likely the bot lacks the "Add New Admins" right, or this is not a supergroup.
+        log.exception("Could not promote user %s in chat %s", adder.id, chat.id)
+    except Exception:
+        log.exception("Unexpected error promoting user %s in chat %s", adder.id, chat.id)
 
 
 # ---------- Service message cleaner ----------
@@ -163,7 +240,7 @@ async def delete_message(message) -> None:
             return
 
 
-async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
@@ -172,15 +249,19 @@ async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await is_enabled(chat.id):
         return
 
-    await delete_message(message)
+    await promote_inviter(message, context)  # before the join message is deleted
+    if DELETE_JOIN_MESSAGES:
+        await delete_message(message)
 
 
-service_filter = None
-if DELETE_JOIN_MESSAGES:
-    service_filter = filters.StatusUpdate.NEW_CHAT_MEMBERS
-if DELETE_LEFT_MESSAGES:
-    left = filters.StatusUpdate.LEFT_CHAT_MEMBER
-    service_filter = left if service_filter is None else service_filter | left
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    if DELETE_LEFT_MESSAGES and await is_enabled(chat.id):
+        await delete_message(message)
 
 
 # ---------- Keepalive (stops Render free instance from sleeping) ----------
@@ -230,10 +311,13 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("stop", cmd_stop, filters=filters.ChatType.GROUPS))
-    if service_filter is not None:
-        app.add_handler(
-            MessageHandler(service_filter & filters.ChatType.GROUPS, on_service_message)
-        )
+    app.add_handler(CommandHandler("edittag", cmd_edittag, filters=filters.ChatType.GROUPS))
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS, on_new_members)
+    )
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER & filters.ChatType.GROUPS, on_left_member)
+    )
 
     # Webhook mode works on Render's web service (it needs an open port)
     app.run_webhook(
