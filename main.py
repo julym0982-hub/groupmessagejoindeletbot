@@ -1,5 +1,6 @@
 # Python version: 3.11.9 (see .python-version). Works on 3.11+.
 import asyncio
+import html as htmllib
 import logging
 import os
 import sys
@@ -7,7 +8,7 @@ import threading
 import time
 import urllib.request
 
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, MongoClient, ReturnDocument
 from telegram import ChatMemberUpdated, Update
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
@@ -36,6 +37,9 @@ PORT = int(os.environ.get("PORT", "10000"))
 # Only this Telegram user id may control the bot (get your id from @userinfobot)
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 
+# How many different people a user must add before they get the admin tag
+INVITES_NEEDED = int(os.environ.get("INVITES_NEEDED", "5"))
+
 DEFAULT_WELCOME = "{name} ကို group မှ ကြိုဆိုပါတယ် 🎉"
 
 # ---------- Database ----------
@@ -46,6 +50,9 @@ settings.create_index([("chat_id", ASCENDING)], unique=True)
 # Users this bot promoted to "title-only" admin (only they may use /edittag)
 promoted = db["promoted_users"]
 promoted.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+# Who each user has added to each chat: {chat_id, user_id, invited: [ids]}
+invites = db["invites"]
+invites.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 # Bot-wide config (welcome text)
 config = db["bot_config"]
 
@@ -86,6 +93,18 @@ def _db_mark_promoted(chat_id: int, user_id: int) -> None:
 
 def _db_is_promoted(chat_id: int, user_id: int) -> bool:
     return promoted.find_one({"chat_id": chat_id, "user_id": user_id}, {"_id": 1}) is not None
+
+
+def _db_add_invite(chat_id: int, user_id: int, invited_id: int) -> int:
+    """Remember that user_id added invited_id; returns how many different people they added.
+    (A set, so someone who leaves and is re-added is not counted twice.)"""
+    doc = invites.find_one_and_update(
+        {"chat_id": chat_id, "user_id": user_id},
+        {"$addToSet": {"invited": invited_id}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return len(doc.get("invited", []))
 
 
 def _db_get_welcome() -> str | None:
@@ -163,17 +182,18 @@ async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         log.warning("Could not notify owner: %s", exc)
 
 
-NOT_OWNER_TEXT ="ဒီ command ကို bot ပိုင်ရှင် admin တစ်ယောက်တည်းသာ သုံးနိုင်ပါတယ်။"
+NOT_OWNER_TEXT = "ဟဟဘဲရမယ်🫩"
+OK_TEXT = "ဟုတ်ကဲ့ပါboss🫡"
 DB_ERROR_TEXT = "ခဏ ပြဿနာရှိနေပါတယ်။ ခဏနေ ပြန်ကြိုးစားပါ။"
 
 HELP_TEXT = """👋 ဒီ bot ကို ပိုင်ရှင် admin တစ်ယောက်တည်းသာ ထိန်းချုပ်နိုင်ပါတယ်။
 
 ━━ Group ထဲမှာ သုံးရမယ့် command ━━
-/start – bot ကို group မှာ စတင်အလုပ်လုပ်ခိုင်းမယ် (join ဝင်သူကို ကြိုဆိုမယ်၊ member ထည့်ပေးသူကို admin tag ပေးမယ်)
+/start – bot ကို group မှာ စတင်အလုပ်လုပ်ခိုင်းမယ် (join ဝင်သူကို ကြိုဆိုမယ်၊ member ၅ယောက် ထည့်ပေးသူကို admin tag ပေးမယ်)
 /stop – bot ကို အကုန်ရပ်မယ်
 /startdelete – "joined / left" notification စာတွေကို ဖျက်မယ် (ဒီအချိန်မှာ ကြိုဆိုစကား မပြောပါ)
 /stopdelete – notification ဖျက်တာကို ရပ်မယ် (ဒီအချိန်မှာမှ ကြိုဆိုစကား ပြောမယ်)
-/edittag စာသား – member ထည့်ပေးထားသူက ကိုယ့် tag ကို ပြောင်းမယ်
+/edittag စာသား – member ၅ယောက် ထည့်ပေးထားသူက ကိုယ့် tag ကို ပြောင်းမယ်
    ဥပမာ - /edittag အရာရာစိတ်ကြိုက်
 
 ━━ ဒီ chat (bot ဆီ) မှာ သုံးရမယ့် command ━━
@@ -207,12 +227,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_reply(update, DB_ERROR_TEXT)
         return
 
-    state = await get_chat(update.effective_chat.id)
-    if state["delete"]:
-        mode = "joined / left စာတွေကို ဖျက်နေပါမယ် (ကြိုဆိုစကား မပြောပါ)။"
-    else:
-        mode = "ဝင်လာသူကို ကြိုဆိုစကား ပြောပေးပါမယ်။ (notification ဖျက်ချင်ရင် /startdelete)"
-    await safe_reply(update, "bot အလုပ်လုပ်နေပါပြီ ✅\n" + mode)
+    await safe_reply(update, OK_TEXT)
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,11 +253,7 @@ async def cmd_startdelete(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         log.exception("Could not save settings for chat %s", update.effective_chat.id)
         await safe_reply(update, DB_ERROR_TEXT)
         return
-    await safe_reply(
-        update,
-        "joined / left စာတွေကို အလိုအလျောက် ဖျက်ပေးပါမယ် ✅\n"
-        "(ဒီအချိန်မှာ ကြိုဆိုစကား မပြောပါ။ ပြောစေချင်ရင် /stopdelete)",
-    )
+    await safe_reply(update, OK_TEXT)
 
 
 async def cmd_stopdelete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -276,7 +287,7 @@ async def cmd_edittag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update, DB_ERROR_TEXT)
         return
     if not allowed:
-        await safe_reply(update, "group ထဲကို member တစ်ယောက် ထည့်ပေးထားမှ /edittag ကို သုံးလို့ရပါမယ်။")
+        await safe_reply(update, f"group ထဲကို member {INVITES_NEEDED}ယောက် ထည့်ပေးထားမှ /edittag ကို သုံးလို့ရပါမယ်။")
         return
 
     tag = " ".join(context.args).strip() if context.args else ""
@@ -298,7 +309,14 @@ async def cmd_edittag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update, "Tag ပြောင်းလို့မရပါ။ ခဏနေ ပြန်ကြိုးစားပါ။")
         return
 
-    await safe_reply(update, f"Tag ကို \"{tag}\" သို့ ပြောင်းပေးလိုက်ပါပြီ ✅")
+    text = (
+        f"{mention_html(user.id, user.full_name)} ရဲ့ Tag နာမည်ကို "
+        f"“{htmllib.escape(tag)}” လို့ ပြောင်းလိုက်ပြီနော် ✍️"
+    )
+    try:
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+    except TelegramError as exc:
+        log.warning("Reply failed in chat %s: %s", chat.id, exc)
 
 
 # ---------- Private chat: welcome text editor (bot owner only) ----------
@@ -419,6 +437,8 @@ async def promote_inviter(chat, adder, context: ContextTypes.DEFAULT_TYPE) -> No
     nothing that matters here: no delete / ban / invite / pin / change info / add admins.
     """
     try:
+        if await asyncio.to_thread(_db_is_promoted, chat.id, adder.id):
+            return  # already got the tag earlier
         member = await context.bot.get_chat_member(chat.id, adder.id)
         if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             # Admins that someone else promoted can't be given a title by the bot.
@@ -473,10 +493,17 @@ async def send_welcome(chat_id: int, users, context: ContextTypes.DEFAULT_TYPE) 
         return
     mentions = ", ".join(mention_html(u.id, u.full_name) for u in users)
     text = render_welcome(await get_welcome(), mentions)
-    try:
-        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-    except TelegramError as exc:
-        log.warning("Welcome failed in chat %s: %s", chat_id, exc)
+    for _ in range(3):
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+            return
+        except RetryAfter as exc:
+            wait = exc.retry_after
+            seconds = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            await asyncio.sleep(min(seconds, 30))
+        except TelegramError as exc:
+            log.warning("Welcome failed in chat %s: %s", chat_id, exc)
+            return
 
 
 def _is_in_chat(member) -> bool:
@@ -492,6 +519,8 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if cmu is None:
         return
     chat = cmu.chat
+    if chat.type not in ("group", "supergroup"):
+        return
     user = cmu.new_chat_member.user
     actor = cmu.from_user
     joined = (not _is_in_chat(cmu.old_chat_member)) and _is_in_chat(cmu.new_chat_member)
@@ -506,9 +535,21 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not state["enabled"]:
         return
 
-    # Added by another person (joining by yourself / via link does not count)
-    if actor is not None and not actor.is_bot and actor.id != user.id:
-        await promote_inviter(chat, actor, context)
+    # Added by another person (joining by yourself / via link / join request does not count)
+    if (
+        actor is not None
+        and not actor.is_bot
+        and actor.id != user.id
+        and not getattr(cmu, "via_join_request", False)
+    ):
+        try:
+            total = await asyncio.to_thread(_db_add_invite, chat.id, actor.id, user.id)
+        except Exception:
+            log.exception("Could not save invite for user %s in chat %s", actor.id, chat.id)
+        else:
+            log.info("User %s has added %d/%d people in chat %s", actor.id, total, INVITES_NEEDED, chat.id)
+            if total >= INVITES_NEEDED:
+                await promote_inviter(chat, actor, context)
 
     if not state["delete"]:  # /stopdelete mode: say welcome
         await send_welcome(chat.id, [user], context)
@@ -524,6 +565,24 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = await get_chat(chat.id)
     if state["enabled"] and state["delete"]:
         await delete_message(message)
+
+
+async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A basic group was upgraded to a supergroup: its chat id changes, so carry the settings over."""
+    message = update.effective_message
+    if message is None or not message.migrate_to_chat_id:
+        return
+    old_id, new_id = message.chat_id, message.migrate_to_chat_id
+    try:
+        state = await get_chat(old_id)
+        await update_chat(new_id, **state)
+        log.info("Moved settings from chat %s to %s", old_id, new_id)
+    except Exception:
+        log.exception("Could not move settings from chat %s to %s", old_id, new_id)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled error while processing an update", exc_info=context.error)
 
 
 async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -601,6 +660,9 @@ def main() -> None:
     app.add_handler(CommandHandler("resetwelcome", pm_resetwelcome, filters=private))
     app.add_handler(CommandHandler("cancel", pm_cancel, filters=private))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, pm_text))
+
+    app.add_error_handler(on_error)
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
 
     # Join events (promote + welcome); works in big groups too
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
