@@ -154,7 +154,15 @@ async def safe_reply(update: Update, text: str) -> None:
         log.warning("Reply failed in chat %s: %s", update.effective_chat.id, exc)
 
 
-NOT_OWNER_TEXT = "ဒီ command ကို bot ပိုင်ရှင် admin တစ်ယောက်တည်းသာ သုံးနိုင်ပါတယ်။"
+async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """DM the bot owner (works once the owner has pressed /start in the bot's private chat)."""
+    try:
+        await context.bot.send_message(ADMIN_ID, text)
+    except TelegramError as exc:
+        log.warning("Could not notify owner: %s", exc)
+
+
+NOT_OWNER_TEXT ="ဒီ command ကို bot ပိုင်ရှင် admin တစ်ယောက်တည်းသာ သုံးနိုင်ပါတယ်။"
 DB_ERROR_TEXT = "ခဏ ပြဿနာရှိနေပါတယ်။ ခဏနေ ပြန်ကြိုးစားပါ။"
 
 HELP_TEXT = """👋 ဒီ bot ကို ပိုင်ရှင် admin တစ်ယောက်တည်းသာ ထိန်းချုပ်နိုင်ပါတယ်။
@@ -412,15 +420,20 @@ async def promote_inviter(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     adder = message.from_user
     chat = message.chat
     if adder is None or adder.is_bot:
+        log.info("Promote skipped in chat %s: no human sender (%s)", chat.id, adder)
         return
     # Joining by yourself (e.g. via invite link) does not count; someone else must be added.
     if not any(m.id != adder.id and not m.is_bot for m in message.new_chat_members):
+        log.info("Promote skipped in chat %s: %s joined by themselves / only bots added", chat.id, adder.id)
         return
 
     try:
         member = await context.bot.get_chat_member(chat.id, adder.id)
         if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-            return  # already an admin / the owner: nothing to do
+            # Already an admin / the owner. Admins that someone else promoted can't be given a
+            # title by the bot, so this is only a real "nothing to do" for admins the bot made.
+            log.info("Promote skipped in chat %s: user %s is already %s", chat.id, adder.id, member.status)
+            return
         await context.bot.promote_chat_member(
             chat.id,
             adder.id,
@@ -429,11 +442,15 @@ async def promote_inviter(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await asyncio.to_thread(_db_mark_promoted, chat.id, adder.id)
         log.info("Promoted user %s to title-only admin in chat %s", adder.id, chat.id)
-    except TelegramError:
+    except Exception as exc:
         # Most likely the bot lacks the "Add New Admins" right, or this is not a supergroup.
         log.exception("Could not promote user %s in chat %s", adder.id, chat.id)
-    except Exception:
-        log.exception("Unexpected error promoting user %s in chat %s", adder.id, chat.id)
+        await notify_owner(
+            context,
+            f"⚠️ {adder.full_name} ({adder.id}) ကို admin ခန့်လို့မရပါ\n"
+            f"Group: {chat.title} ({chat.id})\n"
+            f"အကြောင်းရင်း: {type(exc).__name__}: {exc}",
+        )
 
 
 # ---------- Join / leave handling ----------
@@ -479,6 +496,14 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     state = await get_chat(chat.id)
+    log.info(
+        "Join event in chat %s: enabled=%s delete=%s from=%s new=%s",
+        chat.id,
+        state["enabled"],
+        state["delete"],
+        message.from_user.id if message.from_user else None,
+        [m.id for m in message.new_chat_members],
+    )
     if not state["enabled"]:
         return
 
